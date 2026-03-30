@@ -1,0 +1,264 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Wells Map</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css" />
+  <style>
+    html,body { height:100%; margin:0; font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; }
+    #map { height:100vh; width:100%; }
+    #controls {
+        position: absolute;
+        top: 12px;
+        right: 12px;            
+        z-index: 1200;
+        background: rgba(255,255,255,0.95);
+        padding: 8px 10px;      
+        border-radius: 8px;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.12);
+        width: 230px;           
+        font-size: 13px;        
+        max-height: 85vh;       
+        overflow-y: auto;      
+        }
+    #controls label { display:block; margin-top:8px; font-size:13px; }
+    #controls input[type="text"] { width:100%; padding:6px; box-sizing:border-box; margin-top:4px; }
+    #controls .btn { display:inline-block; margin-top:8px; padding:6px 8px; background:#2b83ba; color:#fff; text-decoration:none; border-radius:6px; cursor:pointer; font-size:13px; }
+    #controls .btn.green { background:#2e7d32; margin-left:8px; }
+    #legend { position:absolute; bottom:12px; left:12px; z-index:1200; background:#fff; padding:8px; border-radius:8px; box-shadow:0 2px 12px rgba(0,0,0,0.12); font-size:13px;}
+    .popup-table { border-collapse:collapse; width:100%; }
+    .popup-table td { padding:4px 6px; vertical-align:top; }
+    .small { font-size:12px; color:#555; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+
+  <div id="controls">
+    <strong>Wells Map Controls</strong>
+    <label>Status
+      <select id="statusFilter" style="width:100%; margin-top:6px;">
+        <option value="">All</option>
+        <option>Active</option>
+        <option>Inactive</option>
+        <option>Abandoned</option>
+        <option>Plugged</option>
+      </select>
+    </label>
+
+    <label>Min barrels oil: <span id="minOilLabel">0</span>
+      <input id="minOil" type="range" min="0" max="10000" step="10" value="0" style="width:100%; margin-top:6px;">
+    </label>
+
+    <label>Search (API or name)
+      <input id="apiSearch" type="text" placeholder="e.g. 33-053-02102 or Basic Game" />
+    </label>
+
+    <div style="margin-top:8px;">
+      <a id="resetBtn" class="btn">Reset</a>
+      <a id="exportBtn" class="btn green">Export CSV</a>
+    </div>
+  </div>
+
+  <div id="legend">
+    <strong>Legend</strong>
+    <div style="margin-top:6px"><span style="display:inline-block;width:12px;height:12px;background:#2b83ba;margin-right:8px;border-radius:2px;"></span> Oil &amp; Gas</div>
+    <div style="margin-top:4px"><span style="display:inline-block;width:12px;height:12px;background:#abdda4;margin-right:8px;border-radius:2px;"></span> Oil only</div>
+    <div style="margin-top:4px"><span style="display:inline-block;width:12px;height:12px;background:#fdae61;margin-right:8px;border-radius:2px;"></span> Gas only</div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
+
+  <script>
+  
+  function escapeHtml(s){ if(!s && s !== 0) return ''; return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
+  function colorForType(type){
+    if(!type) return '#888';
+    const t = String(type).toLowerCase();
+    if(t.includes('oil') && t.includes('gas')) return '#2b83ba';
+    if(t.includes('oil')) return '#abdda4';
+    if(t.includes('gas')) return '#fdae61';
+    return '#888';
+  }
+  // converts the visible json to csv format
+  function jsonToCSV(items){
+    if(!items.length) return '';
+    const keys = Object.keys(items[0]);
+    const lines = [keys.join(',')];
+    items.forEach(it => {
+      const row = keys.map(k => {
+        let v = it[k];
+        if(v === null || v === undefined) return '';
+        if(typeof v === 'object') v = JSON.stringify(v);
+        return `"${String(v).replace(/"/g,'""')}"`;
+      });
+      lines.push(row.join(','));
+    });
+    return lines.join('\n');
+  }
+
+  // map and data, await to fetch
+  (async function(){
+    const map = L.map('map').setView([40, -95], 4);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '&copy; OpenStreetMap contributors' }).addTo(map);
+
+    const cluster = L.markerClusterGroup();
+    let allRows = [];     // raw rows from /api/wells
+    const markersByApi = {}; // api as marker
+
+    // DOM elements
+    const statusFilter = document.getElementById('statusFilter');
+    const minOil = document.getElementById('minOil');
+    const minOilLabel = document.getElementById('minOilLabel');
+    const apiSearch = document.getElementById('apiSearch');
+    const resetBtn = document.getElementById('resetBtn');
+    const exportBtn = document.getElementById('exportBtn');
+
+    // Fetch data from Flask
+    let rows;
+    try {
+      const res = await fetch('/api/wells');
+      rows = await res.json();
+    } catch (err) {
+      console.error('Failed fetching /api/wells', err);
+      document.getElementById('map').innerHTML = '<p style="padding:12px;color:red">Failed to fetch /api/wells — check Flask server and console.</p>';
+      return;
+    }
+
+    if (!Array.isArray(rows) || rows.length === 0) {
+      document.getElementById('map').innerHTML = '<p style="padding:12px;color:#666">No well data returned by the server.</p>';
+      return;
+    }
+
+    // Normalize and create markers
+    allRows = rows.map(r => {
+      // Ensure numeric lat/lo or else leaflet will break
+      return {
+        ...r,
+        latitude: r.latitude !== null && r.latitude !== undefined ? Number(r.latitude) : null,
+        longitude: r.longitude !== null && r.longitude !== undefined ? Number(r.longitude) : null
+      };
+    });
+
+    // Create markers
+    const bounds = [];
+    allRows.forEach(r => {
+      const lat = r.latitude;
+      const lon = r.longitude;
+      if (!isFinite(lat) || !isFinite(lon)) return;
+
+      const props = r;
+      const popup = buildPopup(props);
+
+      // circleMarker for styling
+      const m = L.circleMarker([lat, lon], {
+        radius: 6,
+        fillOpacity: 0.95,
+        color: colorForType(props.well_type),
+        weight: 1
+      }).bindPopup(popup, { maxWidth: 420 });
+
+      m.feature = { properties: props }; // for export/filter
+      cluster.addLayer(m);
+      markersByApi[props.api] = m;
+      bounds.push([lat, lon]);
+    });
+
+    map.addLayer(cluster);
+    if (bounds.length === 1) {
+      map.setView(bounds[0], 12);
+    } else if (bounds.length > 1) {
+      map.fitBounds(bounds, { padding: [20,20] });
+    }
+
+    // filter
+    minOil.addEventListener('input', ()=> { minOilLabel.textContent = minOil.value; applyFilters(); });
+    statusFilter.addEventListener('change', applyFilters);
+    apiSearch.addEventListener('input', applyFilters);
+    resetBtn.addEventListener('click', ()=> { statusFilter.value=''; minOil.value=0; minOilLabel.textContent='0'; apiSearch.value=''; applyFilters(); });
+
+    function applyFilters(){
+      const status = statusFilter.value.trim();
+      const minOilVal = Number(minOil.value) || 0;
+      const q = apiSearch.value.trim().toLowerCase();
+
+      cluster.clearLayers();
+
+      allRows.forEach(r => {
+        const p = r;
+        if (!isFinite(p.latitude) || !isFinite(p.longitude)) return;
+
+        const passStatus = !status || (p.status && p.status === status);
+        const passOil = (p.barrels_oil == null) || (Number(p.barrels_oil) >= minOilVal);
+        const text = ((p.api || '') + ' ' + (p.well_name || '')).toLowerCase();
+        const passText = !q || text.indexOf(q) !== -1;
+
+        if (passStatus && passOil && passText) {
+          const mk = markersByApi[p.api];
+          if (mk) cluster.addLayer(mk);
+        }
+      });
+    }
+
+    // export
+    exportBtn.addEventListener('click', ()=> {
+      const visible = [];
+      cluster.eachLayer(layer => {
+        if (!layer.feature || !layer.feature.properties) return;
+        const p = layer.feature.properties;
+        visible.push({
+          api: p.api,
+          well_name: p.well_name,
+          status: p.status,
+          well_type: p.well_type,
+          closest_city: p.closest_city,
+          latitude: p.latitude,
+          longitude: p.longitude,
+          barrels_oil: p.barrels_oil,
+          barrels_gas: p.barrels_gas
+        });
+      });
+      const csv = jsonToCSV(visible);
+      if (!csv) { alert('No visible wells to export'); return; }
+      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'wells_export.csv';
+      a.click();
+      URL.revokeObjectURL(url);
+    });
+
+    // other helpers
+    function buildPopup(p) {
+      const stim = p.stimulation || (p.stage ? [{ stage: p.stage, fluid_vol: p.fluid_vol, proppant_lbs: p.proppant_lbs }] : []);
+      let html = `<div style="min-width:240px"><h4 style="margin:0 0 6px">${escapeHtml(p.well_name || p.api || 'No name')}</h4>`;
+      html += `<table class="popup-table">`;
+      html += `<tr><td>API</td><td>${escapeHtml(p.api || '')}</td></tr>`;
+      html += `<tr><td>Status</td><td>${escapeHtml(p.status || '')}</td></tr>`;
+      html += `<tr><td>Type</td><td>${escapeHtml(p.well_type || '')}</td></tr>`;
+      html += `<tr><td>Closest city</td><td>${escapeHtml(p.closest_city || '')}</td></tr>`;
+      html += `<tr><td>Latitude</td><td>${p.latitude ?? ''}</td></tr>`;
+      html += `<tr><td>Longitude</td><td>${p.longitude ?? ''}</td></tr>`;
+      html += `<tr><td>Barrels oil</td><td>${p.barrels_oil ?? ''}</td></tr>`;
+      html += `<tr><td>Barrels gas</td><td>${p.barrels_gas ?? ''}</td></tr>`;
+      if (stim && stim.length) {
+        html += `<tr><td>Stim stages</td><td>${stim.length}</td></tr>`;
+        stim.forEach((s,i)=> {
+          html += `<tr><td>Stage ${s.stage ?? (i+1)}</td><td>fluid: ${s.fluid_vol ?? ''}, proppant: ${s.proppant_lbs ?? ''}</td></tr>`;
+        });
+      }
+      html += `</table>`;
+      html += `<details style="margin-top:6px"><summary>Raw JSON</summary><pre style="max-height:180px;overflow:auto">${escapeHtml(JSON.stringify(p.raw_text || p, null, 2))}</pre></details>`;
+      html += `</div>`;
+      return html;
+    }
+
+  })();
+  </script>
+</body>
+</html>
